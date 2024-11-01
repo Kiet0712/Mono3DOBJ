@@ -124,7 +124,7 @@ class DepthAwareTransformer(nn.Module):
 
         inter_references_out = inter_references
         inter_references_out_dim = inter_references_dim
-        return hs, init_reference_out, inter_references_out, inter_references_out_dim, None, None
+        return hs, init_reference_out, inter_references_out, inter_references_out_dim
 
 
 def build_depthaware_transformer(cfg):
