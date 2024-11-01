@@ -280,12 +280,18 @@ def build(cfg):
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality', 'depths', 'dims', 'angles', 'center', 'depth_map']
-    
+    if cfg['use_vfl']:
+        if cfg['use_vfl_with_3dIoU']:
+            losses[0] = 'label_vfl_3d'
+        else:
+            losses[0] = 'label_vfl_2d'
+
     criterion = SetCriterion(
         cfg['num_classes'],
         matcher=matcher,
         weight_dict=weight_dict,
         focal_alpha=cfg['focal_alpha'],
+        focal_gamma=cfg['focal_gamma'],
         losses=losses)
 
     device = torch.device(cfg['device'])

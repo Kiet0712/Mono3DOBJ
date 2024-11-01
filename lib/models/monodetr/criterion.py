@@ -5,7 +5,35 @@ from .depth_predictor.ddn_loss import DDNLoss
 from lib.losses.focal_loss import sigmoid_focal_loss
 from utils.misc import (accuracy, get_world_size,is_dist_avail_and_initialized)
 from utils import box_ops
+import math
 
+def class2angle(cls,residual):
+    angle_per_class = 2 * math.pi / 12.
+    angle_center = cls * angle_per_class
+    angle = angle_center + residual
+    angle[angle > math.pi] = angle[angle > math.pi] - 2*math.pi
+    return angle
+
+def alpha2ry(alpha,u,calibs):
+    cu = calibs[:,0,2]
+    fu = calibs[:,0,0]
+    ry = alpha + torch.atan2(u - cu, fu)
+    ry[ry>math.pi] = ry[ry>math.pi] - 2 *math.pi
+    ry[ry<-math.pi] = ry[ry<-math.pi] + 2 * math.pi
+    return ry
+
+def img_to_rect(uv, depth, calibs):
+    cu = calibs[:,0,2]
+    cv = calibs[:,1,2]
+    fu = calibs[:,0,0]
+    fv = calibs[:,1,1]
+    tx = calibs[:,0,3] / (-fu)
+    ty = calibs[:,1,3] / (-fv)
+    u = uv[:,0]
+    v = uv[:,1]
+    x = ((u - cu) * depth) / fu + tx
+    y = ((v - cv) * depth) / fv + ty
+    return torch.stack((x,y,depth),dim=-1)
 
 class SetCriterion(nn.Module):
     """ This class computes the loss for MonoDETR.
@@ -13,7 +41,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, group_num=11):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, focal_gamma, losses, group_num=11):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -28,9 +56,109 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
         self.ddn_loss = DDNLoss()  # for depth map
         self.group_num = group_num
+    def IoU3D(self, outputs, targets, indices, calibs):
+        idx = self._get_src_permutation_idx(indices)
 
+        src_boxes = outputs['pred_boxes'][:, :, :6][idx]
+        target_boxes = torch.cat([t['boxes_3d'][:, :6][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        
+        src_corner_2d = box_ops.box_cxcylrtb_to_xyxy(src_boxes)
+        src_xywh_2d = box_ops.box_xyxy_to_cxcywh(src_corner_2d)
+
+        target_corner_2d = box_ops.box_cxcylrtb_to_xyxy(target_boxes)
+        target_xywh_2d = box_ops.box_xyxy_to_cxcywh(target_corner_2d)
+
+        src_xs2d = src_xywh_2d[:,0]*torch.tensor([1280], device='cuda')
+        target_xs2d = target_xywh_2d[:,0]*torch.tensor([1280], device='cuda')
+
+        src_3dcenter = outputs['pred_boxes'][:, :, 0: 2][idx] * torch.tensor([1280, 384], device='cuda')
+        target_3dcenter = torch.cat([t['boxes_3d'][:, 0: 2][i] for t, (_, i) in zip(targets, indices)], dim=0)* torch.tensor([1280, 384], device='cuda')
+
+        src_dims = outputs['pred_3d_dim'][idx]
+        target_dims = torch.cat([t['size_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        src_depths = outputs['pred_depth'][idx][:,0]
+        target_depths = torch.cat([t['depth'][i] for t, (_, i) in zip(targets, indices)], dim=0).squeeze()
+        calibs = calibs.unsqueeze(1).repeat(1,outputs['pred_boxes'].shape[1],1,1)[idx]
+        src_center3d = img_to_rect(src_3dcenter,src_depths,calibs)
+        target_center3d = img_to_rect(target_3dcenter,target_depths,calibs)
+
+        heading_input = outputs['pred_angle'][idx]
+        target_heading_cls = torch.cat([t['heading_bin'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        target_heading_res = torch.cat([t['heading_res'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        heading_input = heading_input.view(-1, 24)
+        heading_target_cls = target_heading_cls.view(-1).long()
+        heading_target_res = target_heading_res.view(-1)
+        heading_input_cls = torch.argmax(heading_input[:,0:12],dim=-1)
+        heading_input_res = heading_input[:,12:24][torch.arange(heading_input_cls.shape[0],device="cuda"),heading_input_cls]
+        src_angle = class2angle(heading_input_cls, heading_input_res)
+        target_angle = class2angle(heading_target_cls, heading_target_res)
+        src_ry = alpha2ry(src_angle,src_xs2d,calibs).unsqueeze(-1)
+        target_ry = alpha2ry(target_angle,target_xs2d,calibs).unsqueeze(-1)
+
+        src_boxes3d = torch.cat((src_center3d,src_dims,src_ry),dim=-1)
+        target_boxes3d = torch.cat((target_center3d,target_dims,target_ry),dim=-1)
+        iou3d = torch.diag(box_ops.boxes_iou3d_gpu(src_boxes3d,target_boxes3d)).detach()
+        return iou3d
+    
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, calibs, log=True):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        ious, _ = box_ops.box_iou(box_ops.box_cxcylrtb_to_xyxy(src_boxes), box_ops.box_cxcylrtb_to_xyxy(target_boxes))
+        ious = torch.diag(ious).detach()
+
+        src_logits = outputs['pred_logits']
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype)
+        target_score = target_score_o.unsqueeze(-1) * target
+
+        pred_score = F.sigmoid(src_logits).detach()
+        weight = self.focal_alpha * pred_score.pow(self.focal_gamma) * (1 - target) + target_score
+        
+        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {'loss_vfl_2d': loss}
+
+    def loss_labels_vfl_3DIoU(self, outputs, targets, indices, num_boxes, calibs, log=True):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # ious, _ = box_ops.box_iou(box_ops.box_cxcylrtb_to_xyxy(src_boxes), box_ops.box_cxcylrtb_to_xyxy(target_boxes))
+        # ious = torch.diag(ious).detach()
+        ious = self.IoU3D(outputs, targets, indices, calibs)
+
+        src_logits = outputs['pred_logits']
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype)
+        target_score = target_score_o.unsqueeze(-1) * target
+
+        pred_score = F.sigmoid(src_logits).detach()
+        weight = self.focal_alpha * pred_score.pow(self.focal_gamma) * (1 - target) + target_score
+        
+        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {'loss_vfl_3d': loss}
+    
     def loss_labels(self, outputs, targets, indices, num_boxes, calibs, log=True):
         """Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -50,7 +178,7 @@ class SetCriterion(nn.Module):
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
         target_classes_onehot = target_classes_onehot[:, :, :-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.focal_gamma) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -196,6 +324,8 @@ class SetCriterion(nn.Module):
             'angles': self.loss_angles,
             'center': self.loss_3dcenter,
             'depth_map': self.loss_depth_map,
+            'label_vfl_2d': self.loss_labels_vfl,
+            'label_vfl_3d': self.loss_labels_vfl_3DIoU
         }
 
         assert loss in loss_map, f'do you really want to compute {loss} loss?'

@@ -32,7 +32,8 @@ model:
   #contribution
   depth_aware_matching_3d: False
   stable_epoch_start: 125
-  vfl_3dIoU: False
+  use_vfl: False
+  use_vfl_with_3dIoU: False
   query_self_distillation: False
   relation_self_attention: False
   relation_depth_cross_attention: False
@@ -73,6 +74,7 @@ model:
   # Loss coefficients
   cls_loss_coef: 2
   focal_alpha: 0.25
+  focal_gamma: 2
 
   bbox_loss_coef: 5
   giou_loss_coef: 2
