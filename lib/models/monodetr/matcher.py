@@ -93,9 +93,9 @@ class HungarianMatcher(nn.Module):
 
         dimension = tgt_dims # G, 3
         dim_cost = torch.stack((
-            torch.cdist(out_dims[0:1],tgt_dims[0:1],p=1),
-            torch.cdist(out_dims[1:2],tgt_dims[1:2],p=1),
-            torch.cdist(out_dims[2:3],tgt_dims[2:3],p=1)
+            torch.cdist(out_dims[:,0:1],tgt_dims[:,0:1],p=1),
+            torch.cdist(out_dims[:,1:2],tgt_dims[:,1:2],p=1),
+            torch.cdist(out_dims[:,2:3],tgt_dims[:,2:3],p=1)
         ), dim = -1) # Q, G, 3
         dim_cost /= dimension.unsqueeze(0)
         compensation_weight = torch.cdist(out_dims, tgt_dims, p = 1).mean() / dim_cost.mean()
