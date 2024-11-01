@@ -25,6 +25,7 @@ class DepthAwareTransformer(nn.Module):
             num_feature_levels=4,
             dec_n_points=4,
             enc_n_points=4,
+            relation_depth_cross_attention=False,
             group_num=11):
 
         super().__init__()
@@ -38,8 +39,8 @@ class DepthAwareTransformer(nn.Module):
         self.encoder = VisualEncoder(encoder_layer, num_encoder_layers)
 
         decoder_layer = DepthAwareDecoderLayer(
-            d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points, group_num=group_num)
-        self.decoder = DepthAwareDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec, d_model)
+            d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points, relation_depth_cross_attention, group_num=group_num)
+        self.decoder = DepthAwareDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec, d_model, relation_depth_cross_attention)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
@@ -67,7 +68,7 @@ class DepthAwareTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, depth_pos_embed=None, depth_pos_embed_ip=None, attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, depth_pos_embed=None, depth_pos_embed_ip=None, weighted_depth = None, attn_mask=None):
 
         # prepare input for encoder
         src_flatten = []
@@ -110,7 +111,7 @@ class DepthAwareTransformer(nn.Module):
 
         # decoder
         #ipdb.set_trace()
-        hs, inter_references, inter_references_dim = self.decoder(
+        hs, inter_references, inter_references_dim, inter_references_depths = self.decoder(
             tgt,
             reference_points,
             memory,
@@ -120,11 +121,12 @@ class DepthAwareTransformer(nn.Module):
             query_embed, #,INFo
             mask_flatten,
             depth_pos_embed,
-            mask_depth, bs=bs, depth_pos_embed_ip=depth_pos_embed_ip, pos_embeds=pos_embeds,attn_mask=attn_mask)
+            mask_depth, bs=bs, depth_pos_embed_ip=depth_pos_embed_ip, weighted_depth = weighted_depth, pos_embeds=pos_embeds,attn_mask=attn_mask)
 
         inter_references_out = inter_references
         inter_references_out_dim = inter_references_dim
-        return hs, init_reference_out, inter_references_out, inter_references_out_dim
+        inter_references_out_depths = inter_references_depths
+        return hs, init_reference_out, inter_references_out, inter_references_out_dim, inter_references_out_depths
 
 
 def build_depthaware_transformer(cfg):
@@ -139,4 +141,5 @@ def build_depthaware_transformer(cfg):
         return_intermediate_dec=cfg['return_intermediate_dec'],
         num_feature_levels=cfg['num_feature_levels'],
         dec_n_points=cfg['dec_n_points'],
-        enc_n_points=cfg['enc_n_points'])
+        enc_n_points=cfg['enc_n_points'],
+        relation_depth_cross_attention=cfg['relation_depth_cross_attention'])

@@ -100,6 +100,7 @@ class MonoDETR(nn.Module):
             self.depthaware_transformer.decoder.dim_embed = self.dim_embed_3d  
             self.angle_embed = get_clones(self.angle_embed, num_pred)
             self.depth_embed = get_clones(self.depth_embed, num_pred)
+            self.depthaware_transformer.decoder.depth_embed = self.depth_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
@@ -150,8 +151,8 @@ class MonoDETR(nn.Module):
 
         pred_depth_map_logits, depth_pos_embed, weighted_depth, depth_pos_embed_ip = self.depth_predictor(srcs, masks[1], pos[1])
         
-        hs, init_reference, inter_references, inter_references_dim = self.depthaware_transformer(
-            srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip)#, attn_mask)
+        hs, init_reference, inter_references, inter_references_dim, inter_references_depths = self.depthaware_transformer(
+            srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip, weighted_depth)#, attn_mask)
 
         outputs_coords = []
         outputs_classes = []
@@ -192,7 +193,7 @@ class MonoDETR(nn.Module):
             depth_geo = size3d[:, :, 0] / box2d_height * calibs[:, 0, 0].unsqueeze(1)
 
             # depth_reg
-            depth_reg = self.depth_embed[lvl](hs[lvl])
+            depth_reg = inter_references_depths[lvl]
 
             # depth_map
             outputs_center3d = ((outputs_coord[..., :2] - 0.5) * 2).unsqueeze(2).detach()
