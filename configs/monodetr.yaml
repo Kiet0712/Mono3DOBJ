@@ -31,7 +31,7 @@ model:
 
   #contribution
   depth_aware_matching_3d: False
-  stable_epoch_start: 125
+  stable_epoch_start_matching_3d: 125
   use_vfl: False
   use_vfl_with_3dIoU: False
   query_self_distillation: False
@@ -89,9 +89,9 @@ model:
   set_cost_bbox: 5
   set_cost_giou: 2
   set_cost_3dcenter: 10
-  set_cost_depth: 1
-  set_cost_dim: 1
-  set_cost_angle: 1
+  set_cost_depth: 0
+  set_cost_dim: 0
+  set_cost_angle: 0
 
 optimizer:
   type: 'adamw'

@@ -18,7 +18,7 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_3dcenter: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
+    def __init__(self, cost_class: float = 1, cost_3dcenter: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_depth: float=1, cost_dim: float=1, cost_angle: float=1):
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
@@ -30,30 +30,11 @@ class HungarianMatcher(nn.Module):
         self.cost_3dcenter = cost_3dcenter
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
+        self.cost_depth = cost_depth
+        self.cost_dim = cost_dim
+        self.cost_angle = cost_angle
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
-
-    @torch.no_grad()
-    def forward(self, outputs, targets, group_num=11):
-        """ Performs the matching
-        Params:
-            outputs: This is a dict that contains at least these entries:
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
-                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
-            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                 "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
-                           objects in the target) containing the class labels
-                 "boxes": Tensor of dim [num_target_boxes, 4] containing the target box coordinates
-        Returns:
-            A list of size batch_size, containing tuples of (index_i, index_j) where:
-                - index_i is the indices of the selected predictions (in order)
-                - index_j is the indices of the corresponding selected targets (in order)
-            For each batch element, it holds:
-                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
-        """
-        bs, num_queries = outputs["pred_boxes"].shape[:2]
-
-        # We flatten to compute the cost matrices in a batch
-        
+    def calc_cost_class(self, outputs, targets):
         out_prob = outputs["pred_logits"].flatten(0, 1).sigmoid()  # [batch_size * num_queries, num_classes]
         # Also concat the target labels and boxes
         tgt_ids = torch.cat([v["labels"] for v in targets]).long()
@@ -64,26 +45,83 @@ class HungarianMatcher(nn.Module):
         neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
         pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
         cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
-
+        return cost_class
+    def calc_cost_3dcenter(self, outputs, targets):
         out_3dcenter = outputs["pred_boxes"][:, :, 0: 2].flatten(0, 1)  # [batch_size * num_queries, 4]
         tgt_3dcenter = torch.cat([v["boxes_3d"][:, 0: 2] for v in targets])
 
         # Compute the 3dcenter cost between boxes
         cost_3dcenter = torch.cdist(out_3dcenter, tgt_3dcenter, p=1)
-
+        return cost_3dcenter
+    def calc_cost_bbox(self, outputs, targets):
         out_2dbbox = outputs["pred_boxes"][:, :, 2: 6].flatten(0, 1)  # [batch_size * num_queries, 4]
         tgt_2dbbox = torch.cat([v["boxes_3d"][:, 2: 6] for v in targets])
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_2dbbox, tgt_2dbbox, p=1)
-
+        return cost_bbox
+    def calc_cost_giou(self, outputs, targets):
         # Compute the giou cost betwen boxes
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
         tgt_bbox = torch.cat([v["boxes_3d"] for v in targets])
         cost_giou = -generalized_box_iou(box_cxcylrtb_to_xyxy(out_bbox), box_cxcylrtb_to_xyxy(tgt_bbox))
+        return cost_giou
+    def calc_cost_depth(self, outputs, targets):
+        out_depth = outputs["pred_depth"].flatten(0,1)
+        tgt_depth = torch.cat([v["depth"] for v in targets])
+
+        out_depth, out_depth_log_variance = out_depth[:, 0:1], out_depth[:, 1:2].unsqueeze(-1)
+        depth_cost = 1.1412 * torch.exp(-out_depth_log_variance) * torch.cdist(out_depth, tgt_depth, p = 1) + out_depth_log_variance
+        return depth_cost
+    def calc_cost_angle(self, outputs, targets):
+        out_heading = outputs['pred_angle'].flatten(0,1)
+        tgt_heading_cls = torch.cat([v['heading_bin'] for v in targets]).long()
+        tgt_heading_res = torch.cat([v['heading_res'] for v in targets])
+
+        out_heading_cls = out_heading[:, 0:12].softmax(-1)
+        cls_loss = -(out_heading_cls + 1e-8).log()[:, tgt_heading_cls]
+
+        out_heading_res = out_heading[:, 12:24]
+        cls_onehot = torch.zeros(tgt_heading_cls.shape[0], 12).cuda().scatter_(dim=1, index = tgt_heading_cls, value=1)
+        out_heading_res = torch.sum(out_heading_res*cls_onehot, dim=1, keep_dim=True)
+        reg_loss = torch.cdist(out_heading_res, tgt_heading_res, p = 1)
+
+        return cls_loss + reg_loss
+    def calc_cost_dim(self, outputs, targets):
+        out_dims = outputs['pred_3d_dim'].flatten(0,1)
+        tgt_dims = torch.cat([v['size_3d'] for v in targets])
+
+        dimension = tgt_dims # G, 3
+        dim_cost = torch.stack((
+            torch.cdist(out_dims[0:1],tgt_dims[0:1],p=1),
+            torch.cdist(out_dims[1:2],tgt_dims[1:2],p=1),
+            torch.cdist(out_dims[2:3],tgt_dims[2:3],p=1)
+        ), dim = -1) # N, Q, G, 3
+        dim_cost /= dimension.unsqueeze(0).unsqueeze(0)
+        compensation_weight = torch.cdist(out_dims, tgt_dims, p = 1).mean() / dim_cost.mean()
+        dim_cost = dim_cost*compensation_weight
+        dim_cost = dim_cost.sum(-1)
+        return dim_cost
+    @torch.no_grad()
+    def forward(self, outputs, targets, group_num=11):
+        bs, num_queries = outputs["pred_boxes"].shape[:2]
+
+        cost_class = self.calc_cost_class(outputs, targets)
+
+        cost_3dcenter = self.calc_cost_3dcenter(outputs, targets)
+
+        cost_bbox = self.calc_cost_bbox(outputs, targets)
+
+        cost_giou = self.calc_cost_giou(outputs, targets)
+
+        cost_depth = self.calc_cost_depth(outputs, targets)
+        
+        cost_angle = self.calc_cost_angle(outputs, targets)
+
+        cost_dim = self.calc_cost_dim(outputs, targets)
 
         # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_3dcenter * cost_3dcenter + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = self.cost_bbox * cost_bbox + self.cost_3dcenter * cost_3dcenter + self.cost_class * cost_class + self.cost_giou * cost_giou + self.cost_depth * cost_depth + self.cost_angle*cost_angle + self.cost_dim*cost_dim
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
@@ -109,4 +147,7 @@ def build_matcher(cfg):
         cost_class=cfg['set_cost_class'],
         cost_bbox=cfg['set_cost_bbox'],
         cost_3dcenter=cfg['set_cost_3dcenter'],
-        cost_giou=cfg['set_cost_giou'])
+        cost_giou=cfg['set_cost_giou'],
+        cost_depth=cfg["set_cost_depth"],
+        cost_dim=cfg['set_cost_dim'],
+        cost_angle=cfg['set_cost_angle'])
