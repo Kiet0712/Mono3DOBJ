@@ -82,9 +82,9 @@ class HungarianMatcher(nn.Module):
         cls_loss = -(out_heading_cls + 1e-8).log()[:, tgt_heading_cls]
 
         out_heading_res = out_heading[:, 12:24]
-        cls_onehot = torch.zeros(tgt_heading_cls.shape[0], 12).cuda().scatter_(dim=1, index = tgt_heading_cls, value=1)
-        out_heading_res = torch.sum(out_heading_res*cls_onehot, dim=1, keep_dim=True)
-        reg_loss = torch.cdist(out_heading_res, tgt_heading_res, p = 1)
+        #cls_onehot = torch.zeros(tgt_heading_cls.shape[0], 12).cuda().scatter_(dim=1, index = tgt_heading_cls, value=1)
+        out_heading_res = out_heading_res[:,tgt_heading_cls] #B, N, G
+        reg_loss = (out_heading_res-tgt_heading_res.unsqueeze(0)).squeeze(-1).abs()
 
         return cls_loss + reg_loss
     def calc_cost_dim(self, outputs, targets):
