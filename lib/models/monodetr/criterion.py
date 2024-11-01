@@ -41,7 +41,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, focal_gamma, losses, group_num=11):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, focal_gamma, losses, query_self_distillation=False, group_num=11):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -59,6 +59,7 @@ class SetCriterion(nn.Module):
         self.focal_gamma = focal_gamma
         self.ddn_loss = DDNLoss()  # for depth map
         self.group_num = group_num
+        self.query_self_distillation = query_self_distillation
     def IoU3D(self, outputs, targets, indices, calibs):
         idx = self._get_src_permutation_idx(indices)
 
@@ -135,8 +136,8 @@ class SetCriterion(nn.Module):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
 
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # src_boxes = outputs['pred_boxes'][idx]
+        # target_boxes = torch.cat([t['boxes_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         # ious, _ = box_ops.box_iou(box_ops.box_cxcylrtb_to_xyxy(src_boxes), box_ops.box_cxcylrtb_to_xyxy(target_boxes))
         # ious = torch.diag(ious).detach()
         ious = self.IoU3D(outputs, targets, indices, calibs)
@@ -360,8 +361,9 @@ class SetCriterion(nn.Module):
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
+            iou3d = self.IoU3D(outputs, targets, indices, calibs)
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets, group_num=group_num)
+                indices_i = self.matcher(aux_outputs, targets, group_num=group_num)
                 for loss in self.losses:
                     if loss == 'depth_map':
                         # Intermediate masks losses are too costly to compute, we ignore them.
@@ -370,7 +372,16 @@ class SetCriterion(nn.Module):
                     if loss == 'labels':
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, calibs, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices_i, num_boxes, calibs, **kwargs)
+                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+                if self.query_self_distillation:
+                    idx_i = self._get_src_permutation_idx(indices_i)
+                    idx = self._get_src_permutation_idx(indices)
+                    query_i = aux_outputs['query'][idx_i]
+                    query = outputs['query'][idx]
+                    loss_query_self_distillation = iou3d * F.smooth_l1_loss(query_i, query.detach(), beta=2.0, reduction=None)
+                    l_dict = {'loss_query_self_distillation':loss_query_self_distillation}
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
         return losses

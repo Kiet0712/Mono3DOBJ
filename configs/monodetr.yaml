@@ -83,7 +83,7 @@ model:
   angle_loss_coef: 1
   depth_loss_coef: 1
   depth_map_loss_coef: 1
-
+  query_self_distillation_loss_coef: 0.2
   # Matcher
   set_cost_class: 2
   set_cost_bbox: 5

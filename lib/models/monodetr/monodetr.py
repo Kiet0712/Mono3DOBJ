@@ -19,7 +19,7 @@ from .criterion import SetCriterion
 class MonoDETR(nn.Module):
     """ This is the MonoDETR module that performs monocualr 3D object detection """
     def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, group_num=11):
+                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, query_self_distillation=False, group_num=11):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -108,7 +108,9 @@ class MonoDETR(nn.Module):
             self.angle_embed = nn.ModuleList([self.angle_embed for _ in range(num_pred)])
             self.depth_embed = nn.ModuleList([self.depth_embed for _ in range(num_pred)])
             self.depthaware_transformer.decoder.bbox_embed = None
-
+        self.query_self_distillation = query_self_distillation
+        if query_self_distillation:
+            self.proj_self_distillation = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, images, calibs, img_sizes):
         """ The forward expects a NestedTensor, which consists of:
@@ -220,21 +222,38 @@ class MonoDETR(nn.Module):
         out['pred_depth'] = outputs_depth[-1]
         out['pred_angle'] = outputs_angle[-1]
         out['pred_depth_map_logits'] = pred_depth_map_logits
-
+        if self.query_self_distillation:
+            if self.training:
+                out['query'] = hs[-1]
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(
-                outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
+            if not self.query_self_distillation:
+                out['aux_outputs'] = self._set_aux_loss(
+                        outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
+            else:
+                if self.training:
+                    out['aux_outputs'] = self._set_aux_loss(
+                        outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth, hs)
+                else:
+                    out['aux_outputs'] = self._set_aux_loss(
+                        outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
         return out #, mask_dict
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth, hs=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 
-                 'pred_3d_dim': c, 'pred_angle': d, 'pred_depth': e}
-                for a, b, c, d, e in zip(outputs_class[:-1], outputs_coord[:-1],
-                                         outputs_3d_dim[:-1], outputs_angle[:-1], outputs_depth[:-1])]
+        if hs==None:
+            return [{'pred_logits': a, 'pred_boxes': b, 
+                    'pred_3d_dim': c, 'pred_angle': d, 'pred_depth': e}
+                    for a, b, c, d, e in zip(outputs_class[:-1], outputs_coord[:-1],
+                                            outputs_3d_dim[:-1], outputs_angle[:-1], outputs_depth[:-1])]
+        else:
+            return [{'pred_logits': a, 'pred_boxes': b, 
+                    'pred_3d_dim': c, 'pred_angle': d, 'pred_depth': e, 'query': self.proj_self_distillation(f)}
+                    for a, b, c, d, e, f in zip(outputs_class[:-1], outputs_coord[:-1],
+                                            outputs_3d_dim[:-1], outputs_angle[:-1], outputs_depth[:-1], hs[:-1])]
+                
 
 
 
@@ -257,7 +276,8 @@ def build(cfg):
         aux_loss=cfg['aux_loss'],
         num_feature_levels=cfg['num_feature_levels'],
         with_box_refine=cfg['with_box_refine'],
-        init_box=cfg['init_box'])
+        init_box=cfg['init_box'],
+        query_self_distillation=cfg['query_self_distillation'])
 
     # matcher
     matcher = build_matcher(cfg)
@@ -270,7 +290,7 @@ def build(cfg):
     weight_dict['loss_depth'] = cfg['depth_loss_coef']
     weight_dict['loss_center'] = cfg['3dcenter_loss_coef']
     weight_dict['loss_depth_map'] = cfg['depth_map_loss_coef']
-
+    weight_dict['loss_query_self_distillation'] = cfg['query_self_distillation_loss_coef']
     # TODO this is a hack
     if cfg['aux_loss']:
         aux_weight_dict = {}
@@ -292,7 +312,8 @@ def build(cfg):
         weight_dict=weight_dict,
         focal_alpha=cfg['focal_alpha'],
         focal_gamma=cfg['focal_gamma'],
-        losses=losses)
+        losses=losses,
+        query_self_distillation=cfg['query_self_distillation'])
 
     device = torch.device(cfg['device'])
     criterion.to(device)
