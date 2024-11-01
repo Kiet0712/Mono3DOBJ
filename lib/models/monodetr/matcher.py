@@ -70,7 +70,7 @@ class HungarianMatcher(nn.Module):
         out_depth = outputs["pred_depth"].flatten(0,1)
         tgt_depth = torch.cat([v["depth"] for v in targets])
 
-        out_depth, out_depth_log_variance = out_depth[:, 0:1], out_depth[:, 1:2].unsqueeze(-1)
+        out_depth, out_depth_log_variance = out_depth[:, 0:1], out_depth[:, 1:2]
         depth_cost = 1.1412 * torch.exp(-out_depth_log_variance) * torch.cdist(out_depth, tgt_depth, p = 1) + out_depth_log_variance
         return depth_cost
     def calc_cost_angle(self, outputs, targets):
@@ -79,7 +79,7 @@ class HungarianMatcher(nn.Module):
         tgt_heading_res = torch.cat([v['heading_res'] for v in targets])
 
         out_heading_cls = out_heading[:, 0:12].softmax(-1)
-        cls_loss = -(out_heading_cls + 1e-8).log()[:, tgt_heading_cls]
+        cls_loss = -(out_heading_cls + 1e-8).log()[:, tgt_heading_cls].squeeze(-1)
 
         out_heading_res = out_heading[:, 12:24]
         #cls_onehot = torch.zeros(tgt_heading_cls.shape[0], 12).cuda().scatter_(dim=1, index = tgt_heading_cls, value=1)
