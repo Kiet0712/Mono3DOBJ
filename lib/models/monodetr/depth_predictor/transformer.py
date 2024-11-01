@@ -1,23 +1,16 @@
-import copy
-
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
 
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from utils.misc import get_clones, get_activation_fn
 
 
 class TransformerEncoder(nn.Module):
 
     def __init__(self, encoder_layer, num_layers, norm=None):
         super().__init__()
-        self.layers = _get_clones(encoder_layer, num_layers)
+        self.layers = get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
 
@@ -49,7 +42,7 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = _get_activation_fn(activation)
+        self.activation = get_activation_fn(activation)
 
     def with_pos_embed(self, tensor, pos):
         return tensor if pos is None else tensor + pos
@@ -64,13 +57,3 @@ class TransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-
-def _get_activation_fn(activation):
-    """Return an activation function given a string"""
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
