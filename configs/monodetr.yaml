@@ -48,10 +48,6 @@ model:
 
   # Transformer
   with_box_refine: True
-  two_stage: False
-  use_dab: False
-  use_dn: False
-  two_stage_dino: False
   init_box: False
   enc_layers: 3
   dec_layers: 3
@@ -62,11 +58,6 @@ model:
   num_queries: 50
   enc_n_points: 4
   dec_n_points: 4
-  # DN
-  scalar: 5
-  label_noise_scale: 0.2
-  box_noise_scale: 0.4
-  num_patterns: 0
   # Loss
   aux_loss: True
 
@@ -110,10 +101,6 @@ trainer:
   # pretrain_model: path/to/ckpt
   save_path: 'outputs/'
   save_all: False  # False for only savng the best and latest ckpts
-  use_dn: False
-  scalar: 5
-  label_noise_scale: 0.2
-  box_noise_scale: 0.4
   num_patterns: 0
 
 tester:

@@ -126,14 +126,10 @@ class Trainer(object):
                 targets[key] = targets[key].to(self.device)
             img_sizes = targets['img_size']
             targets = self.prepare_targets(targets, inputs.shape[0])
-            ##dn
-            dn_args = None
-            if self.cfg["use_dn"]:
-                dn_args=(targets, self.cfg['scalar'], self.cfg['label_noise_scale'], self.cfg['box_noise_scale'], self.cfg['num_patterns'])
             ###
             # train one batch
             self.optimizer.zero_grad()
-            outputs = self.model(inputs, calibs, targets, img_sizes, dn_args=dn_args)
+            outputs = self.model(inputs, calibs, img_sizes)
             mask_dict=None
             #ipdb.set_trace()
             detr_losses_dict = self.detr_loss(outputs, targets, mask_dict)

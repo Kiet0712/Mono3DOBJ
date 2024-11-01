@@ -19,7 +19,7 @@ from .criterion import SetCriterion
 class MonoDETR(nn.Module):
     """ This is the MonoDETR module that performs monocualr 3D object detection """
     def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, use_dab=False, group_num=11, two_stage_dino=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, group_num=11):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -39,7 +39,6 @@ class MonoDETR(nn.Module):
         hidden_dim = depthaware_transformer.d_model
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
-        self.two_stage_dino = two_stage_dino
         self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)  # # for indicator
         # prediction heads
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -51,20 +50,12 @@ class MonoDETR(nn.Module):
         self.dim_embed_3d = MLP(hidden_dim, hidden_dim, 3, 2)
         self.angle_embed = MLP(hidden_dim, hidden_dim, 24, 2)
         self.depth_embed = MLP(hidden_dim, hidden_dim, 2, 2)  # depth and deviation
-        self.use_dab = use_dab
 
         if init_box == True:
             nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
-        if not two_stage:
-            if two_stage_dino:
-                self.query_embed = None
-            if not use_dab:
-                self.query_embed = nn.Embedding(num_queries * group_num, hidden_dim*2)
-            else:
-                self.tgt_embed = nn.Embedding(num_queries * group_num, hidden_dim)
-                self.refpoint_embed = nn.Embedding(num_queries * group_num, 6)
+        self.query_embed = nn.Embedding(num_queries * group_num, hidden_dim*2)
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -92,20 +83,7 @@ class MonoDETR(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
-        self.two_stage = two_stage
         self.num_classes = num_classes
-
-        if self.two_stage_dino:        
-            _class_embed = nn.Linear(hidden_dim, num_classes)
-            _bbox_embed = MLP(hidden_dim, hidden_dim, 6, 3)
-            # init the two embed layers
-            prior_prob = 0.01
-            bias_value = -math.log((1 - prior_prob) / prior_prob)
-            _class_embed.bias.data = torch.ones(num_classes) * bias_value
-            nn.init.constant_(_bbox_embed.layers[-1].weight.data, 0)
-            nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)   
-            self.depthaware_transformer.enc_out_bbox_embed = copy.deepcopy(_bbox_embed)
-            self.depthaware_transformer.enc_out_class_embed = copy.deepcopy(_class_embed)
 
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
@@ -131,14 +109,8 @@ class MonoDETR(nn.Module):
             self.depth_embed = nn.ModuleList([self.depth_embed for _ in range(num_pred)])
             self.depthaware_transformer.decoder.bbox_embed = None
 
-        if two_stage:
-            # hack implementation for two-stage
-            self.depthaware_transformer.decoder.class_embed = self.class_embed
-            for box_embed in self.bbox_embed:
-                nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-
-    def forward(self, images, calibs, targets, img_sizes, dn_args=None):
+    def forward(self, images, calibs, img_sizes):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -168,30 +140,15 @@ class MonoDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        if self.two_stage:
-            query_embeds = None
-        elif self.use_dab:
-            if self.training:
-                tgt_all_embed=tgt_embed = self.tgt_embed.weight           # nq, 256
-                refanchor = self.refpoint_embed.weight      # nq, 4
-                query_embeds = torch.cat((tgt_embed, refanchor), dim=1) 
-                
-            else:
-                tgt_all_embed=tgt_embed = self.tgt_embed.weight[:self.num_queries]         
-                refanchor = self.refpoint_embed.weight[:self.num_queries]  
-                query_embeds = torch.cat((tgt_embed, refanchor), dim=1) 
-        elif self.two_stage_dino:
-            query_embeds = None
+        if self.training:
+            query_embeds = self.query_embed.weight
         else:
-            if self.training:
-                query_embeds = self.query_embed.weight
-            else:
-                # only use one group in inference
-                query_embeds = self.query_embed.weight[:self.num_queries]
+            # only use one group in inference
+            query_embeds = self.query_embed.weight[:self.num_queries]
 
         pred_depth_map_logits, depth_pos_embed, weighted_depth, depth_pos_embed_ip = self.depth_predictor(srcs, masks[1], pos[1])
         
-        hs, init_reference, inter_references, inter_references_dim, enc_outputs_class, enc_outputs_coord_unact = self.depthaware_transformer(
+        hs, init_reference, inter_references, inter_references_dim = self.depthaware_transformer(
             srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip)#, attn_mask)
 
         outputs_coords = []
@@ -267,10 +224,6 @@ class MonoDETR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
                 outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
-
-        if self.two_stage:
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
-            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
         return out #, mask_dict
 
     @torch.jit.unused
@@ -304,10 +257,7 @@ def build(cfg):
         aux_loss=cfg['aux_loss'],
         num_feature_levels=cfg['num_feature_levels'],
         with_box_refine=cfg['with_box_refine'],
-        two_stage=cfg['two_stage'],
-        init_box=cfg['init_box'],
-        use_dab = cfg['use_dab'],
-        two_stage_dino=cfg['two_stage_dino'])
+        init_box=cfg['init_box'])
 
     # matcher
     matcher = build_matcher(cfg)
@@ -320,14 +270,6 @@ def build(cfg):
     weight_dict['loss_depth'] = cfg['depth_loss_coef']
     weight_dict['loss_center'] = cfg['3dcenter_loss_coef']
     weight_dict['loss_depth_map'] = cfg['depth_map_loss_coef']
-    
-    # dn loss
-    if cfg['use_dn']:
-        weight_dict['tgt_loss_ce']= cfg['cls_loss_coef']
-        weight_dict['tgt_loss_bbox'] = cfg['bbox_loss_coef']
-        weight_dict['tgt_loss_giou'] = cfg['giou_loss_coef']
-        weight_dict['tgt_loss_angle'] = cfg['angle_loss_coef']
-        weight_dict['tgt_loss_center'] = cfg['3dcenter_loss_coef']
 
     # TODO this is a hack
     if cfg['aux_loss']:

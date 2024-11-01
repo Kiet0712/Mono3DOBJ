@@ -177,7 +177,7 @@ class DepthAwareDecoderLayer(nn.Module):
 
 
 class DepthAwareDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False, d_model=None, use_dab=False, two_stage_dino=False):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False, d_model=None):
         super().__init__()
         self.layers = get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
@@ -186,25 +186,8 @@ class DepthAwareDecoder(nn.Module):
         self.bbox_embed = None
         self.dim_embed = None
         self.class_embed = None
-        self.use_dab=use_dab
-        self.two_stgae_dino = two_stage_dino
-        if use_dab:
-            self.query_scale = MLP(d_model, d_model, d_model, 2)
-            self.query_scale_bbox = MLP(d_model, 2, 2, 2)
-            self.ref_point_head = MLP(3 * d_model, d_model, d_model, 2)
-        elif two_stage_dino:
-            self.ref_point_head = MLP(3 * d_model, d_model, d_model, 2)
-            #self.query_scale = None
-            self.query_scale = MLP(d_model, d_model, d_model, 2)
-            self.query_pos_sine_scale = None
-            self.ref_anchor_head = None
-        else:
-            self.query_scale = MLP(d_model, d_model, d_model, 2)
-            self.ref_point_head = MLP(d_model, d_model, 2, 2)
-        #conditional
-        # for layer_id in range(num_layers - 1):
-        #     self.layers[layer_id + 1].ca_qpos_proj = None
-        ###
+        self.query_scale = MLP(d_model, d_model, d_model, 2)
+        self.ref_point_head = MLP(d_model, d_model, 2, 2)
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None, depth_pos_embed=None, mask_depth=None, bs=None, depth_pos_embed_ip=None, pos_embeds=None, attn_mask=None):
@@ -214,11 +197,6 @@ class DepthAwareDecoder(nn.Module):
         intermediate_reference_points = []
         intermediate_reference_dims = []
         bs = src.shape[0]
-        ###for dn
-        if self.use_dab:
-            reference_points = reference_points[None].repeat(bs, 1, 1)
-        elif self.two_stgae_dino:
-            reference_points = reference_points.sigmoid()
 
         
         for lid, layer in enumerate(self.layers):
@@ -230,23 +208,9 @@ class DepthAwareDecoder(nn.Module):
                 assert reference_points.shape[-1] == 2
                 
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            if self.two_stgae_dino:
-                
-                query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :])
-                raw_query_pos = self.ref_point_head(query_sine_embed) # nq, bs, 256
-                
-                pos_scale = self.query_scale(output) if lid != 0 else 1
-                query_pos = pos_scale * raw_query_pos
             ###conditional
             #ipdb.set_trace()
             query_pos_un=None
-            if self.use_dab:
-                
-                query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # bs, nq, 256*2 
-                raw_query_pos = self.ref_point_head(query_sine_embed) # bs, nq, 256
-                pos_scale = self.query_scale(output) if lid != 0 else 1
-                #pos_scale  = 1
-                query_pos = pos_scale * raw_query_pos
                 
             output = layer(output,
                            query_pos,
