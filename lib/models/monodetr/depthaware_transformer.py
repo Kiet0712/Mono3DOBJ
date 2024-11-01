@@ -54,9 +54,8 @@ class DepthAwareTransformer(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
-        if not self.two_stage and not self.use_dab and not self.two_stage_dino:
-            xavier_uniform_(self.reference_points.weight.data, gain=1.0)
-            constant_(self.reference_points.bias.data, 0.)
+        xavier_uniform_(self.reference_points.weight.data, gain=1.0)
+        constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
 
     def get_valid_ratio(self, mask):
