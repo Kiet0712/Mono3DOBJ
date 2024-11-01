@@ -28,6 +28,15 @@ dataset:
 
 model_name: 'monodetr'
 model:
+
+  #contribution
+  depth_aware_matching_3d: False
+  stable_epoch_start: 125
+  vfl_3dIoU: False
+  query_self_distillation: False
+  relation_self_attention: False
+  relation_depth_cross_attention: False
+
   num_classes: 3
   return_intermediate_dec: True
   device: 'cuda'
@@ -78,7 +87,9 @@ model:
   set_cost_bbox: 5
   set_cost_giou: 2
   set_cost_3dcenter: 10
-
+  set_cost_depth: 1
+  set_cost_dim: 1
+  set_cost_angle: 1
 
 optimizer:
   type: 'adamw'

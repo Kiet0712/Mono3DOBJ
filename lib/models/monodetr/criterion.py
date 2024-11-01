@@ -5,6 +5,8 @@ from .depth_predictor.ddn_loss import DDNLoss
 from lib.losses.focal_loss import sigmoid_focal_loss
 from utils.misc import (accuracy, get_world_size,is_dist_avail_and_initialized)
 from utils import box_ops
+
+
 class SetCriterion(nn.Module):
     """ This class computes the loss for MonoDETR.
     The process happens in two steps:
@@ -29,7 +31,7 @@ class SetCriterion(nn.Module):
         self.ddn_loss = DDNLoss()  # for depth map
         self.group_num = group_num
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels(self, outputs, targets, indices, num_boxes, calibs, log=True):
         """Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -57,7 +59,7 @@ class SetCriterion(nn.Module):
         return losses
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+    def loss_cardinality(self, outputs, targets, indices, num_boxes, calibs):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
@@ -70,7 +72,7 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_3dcenter(self, outputs, targets, indices, num_boxes):
+    def loss_3dcenter(self, outputs, targets, indices, num_boxes, calibs):
         
         idx = self._get_src_permutation_idx(indices)
         src_3dcenter = outputs['pred_boxes'][:, :, 0: 2][idx]
@@ -81,7 +83,7 @@ class SetCriterion(nn.Module):
         losses['loss_center'] = loss_3dcenter.sum() / num_boxes
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, calibs):
         
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -102,7 +104,7 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
-    def loss_depths(self, outputs, targets, indices, num_boxes):  
+    def loss_depths(self, outputs, targets, indices, num_boxes, calibs):  
 
         idx = self._get_src_permutation_idx(indices)
    
@@ -115,7 +117,7 @@ class SetCriterion(nn.Module):
         losses['loss_depth'] = depth_loss.sum() / num_boxes 
         return losses  
     
-    def loss_dims(self, outputs, targets, indices, num_boxes):  
+    def loss_dims(self, outputs, targets, indices, num_boxes, calibs):  
 
         idx = self._get_src_permutation_idx(indices)
         src_dims = outputs['pred_3d_dim'][idx]
@@ -131,7 +133,7 @@ class SetCriterion(nn.Module):
         losses['loss_dim'] = dim_loss.sum() / num_boxes
         return losses
 
-    def loss_angles(self, outputs, targets, indices, num_boxes):  
+    def loss_angles(self, outputs, targets, indices, num_boxes, calibs):  
 
         idx = self._get_src_permutation_idx(indices)
         heading_input = outputs['pred_angle'][idx]
@@ -157,7 +159,7 @@ class SetCriterion(nn.Module):
         losses['loss_angle'] = angle_loss.sum() / num_boxes 
         return losses
 
-    def loss_depth_map(self, outputs, targets, indices, num_boxes):
+    def loss_depth_map(self, outputs, targets, indices, num_boxes, calibs):
         depth_map_logits = outputs['pred_depth_map_logits']
 
         num_gt_per_img = [len(t['boxes']) for t in targets]
@@ -183,7 +185,7 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, calibs, **kwargs):
         
         loss_map = {
             'labels': self.loss_labels,
@@ -197,9 +199,9 @@ class SetCriterion(nn.Module):
         }
 
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        return loss_map[loss](outputs, targets, indices, num_boxes, calibs, **kwargs)
 
-    def forward(self, outputs, targets, mask_dict=None):
+    def forward(self, outputs, targets, calibs, mask_dict=None):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -224,7 +226,7 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             #ipdb.set_trace()
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, calibs))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -238,7 +240,7 @@ class SetCriterion(nn.Module):
                     if loss == 'labels':
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, calibs, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
         return losses

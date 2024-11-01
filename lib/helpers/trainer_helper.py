@@ -132,7 +132,7 @@ class Trainer(object):
             outputs = self.model(inputs, calibs, img_sizes)
             mask_dict=None
             #ipdb.set_trace()
-            detr_losses_dict = self.detr_loss(outputs, targets, mask_dict)
+            detr_losses_dict = self.detr_loss(outputs, targets, calibs, mask_dict)
 
             weight_dict = self.detr_loss.weight_dict
             detr_losses_dict_weighted = [detr_losses_dict[k] * weight_dict[k] for k in detr_losses_dict.keys() if k in weight_dict]
