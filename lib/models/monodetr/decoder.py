@@ -302,7 +302,7 @@ class DepthAwareDecoder(nn.Module):
                            src_padding_mask,
                            depth_pos_embed,
                            mask_depth, bs,query_sine_embed=None,
-                           is_first=(lid == 0), depth_pos_embed_ip=depth_pos_embed_ip, pos_embeds=pos_embeds, self_attn_mask=attn_mask, depth_cross_attention_mask = depth_cross_attention_mask,query_pos_un=query_pos_un)
+                           is_first=(lid == 0), depth_pos_embed_ip=depth_pos_embed_ip, pos_embeds=pos_embeds, self_attn_mask=attn_mask, depth_cross_attn_mask = depth_cross_attention_mask,query_pos_un=query_pos_un)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
