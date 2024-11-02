@@ -39,7 +39,7 @@ class DepthAwareTransformer(nn.Module):
         self.encoder = VisualEncoder(encoder_layer, num_encoder_layers)
 
         decoder_layer = DepthAwareDecoderLayer(
-            d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points, relation_depth_cross_attention, group_num=group_num)
+            d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points, group_num=group_num)
         self.decoder = DepthAwareDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec, d_model, relation_depth_cross_attention)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
