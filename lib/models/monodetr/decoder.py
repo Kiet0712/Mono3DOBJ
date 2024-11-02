@@ -118,8 +118,7 @@ class DepthRelationEmbedding(nn.Module):
             pos_embed = depth_rel_encoding(predict_depth, depth_map)
             pos_embed = self.pos_func(pos_embed)
         pos_embed = self.pos_proj(pos_embed).permute(0, 3, 1, 2)
-        B, H, N, T = pos_embed.shape
-        return pos_embed.view(B*H, N, T)
+        return pos_embed.flatten(0,1)
 class DepthAwareDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
