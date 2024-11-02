@@ -49,6 +49,7 @@ def depth_rel_encoding(predict_depth, depth_map, eps=1e-5):
     #depth_map: B, H, W
     B, H, W = depth_map.shape
     depth_map = depth_map.view(B, H*W)
+    predict_depth = F.relu(predict_depth, True)
     delta_depth = torch.log((predict_depth.unsqueeze(-1) + eps) / (depth_map.unsqueeze(-2) + eps)) # B, N, H*W
     return delta_depth.unsqueeze(-1)
 
