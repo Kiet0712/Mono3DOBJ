@@ -124,14 +124,21 @@ class KITTI_Dataset(data.Dataset):
         # image loading
         img = self.get_image(index)
         img_size = np.array(img.size)
+        if self.split!='test':
+            dst_W, dst_H = img_size
         features_size = self.resolution // self.downsample    # W * H
 
         # data augmentation for image
         center = np.array(img_size) / 2
         crop_size, crop_scale = img_size, 1
         random_flip_flag, random_crop_flag = False, False
+        random_mix_flag = False
+        calib = self.get_calib(index)
 
         if self.data_augmentation:
+            
+            if np.random.random() < 0.5:
+                random_mix_flag = True
 
             if self.aug_pd:
                 img = np.array(img).astype(np.float32)
@@ -149,6 +156,33 @@ class KITTI_Dataset(data.Dataset):
                     crop_size = img_size * crop_scale
                     center[0] += img_size[0] * np.clip(np.random.randn() * self.shift, -2 * self.shift, 2 * self.shift)
                     center[1] += img_size[1] * np.clip(np.random.randn() * self.shift, -2 * self.shift, 2 * self.shift)
+
+        if random_mix_flag == True:
+            count_num = 0
+            random_mix_flag = False
+            while count_num < 50:
+                count_num += 1
+                random_index = np.random.randint(len(self.idx_list))
+                random_index = int(self.idx_list[random_index])
+                calib_temp = self.get_calib(random_index)
+                if calib_temp.cu == calib.cu and calib_temp.cv == calib.cv and calib_temp.fu == calib.fu and calib_temp.fv == calib.fv:
+                    img_temp = self.get_image(random_index)
+                    img_size_temp = np.array(img.size)
+                    dst_W_temp, dst_H_temp = img_size_temp
+                    if dst_W_temp == dst_W and dst_H_temp == dst_H:
+                        objects_1 = self.get_label(index)
+                        objects_2 = self.get_label(random_index)
+                        if len(objects_1) + len(objects_2) < self.max_objs: 
+                            random_mix_flag = True
+                            if self.aug_pd:
+                                img_temp = np.array(img_temp).astype(np.float32)
+                                img_temp = self.pd(img_temp).astype(np.uint8)
+                                img_temp = Image.fromarray(img_temp)
+                            if random_flip_flag == True:
+                                img_temp = img_temp.transpose(Image.FLIP_LEFT_RIGHT)
+                            img_blend = Image.blend(img, img_temp, alpha=0.5)
+                            img = img_blend
+                            break
 
         # add affine transformation for 2d images.
         trans, trans_inv = get_affine_transform(center, crop_size, 0, self.resolution, inv=1)
@@ -172,7 +206,6 @@ class KITTI_Dataset(data.Dataset):
 
         #  ============================   get labels   ==============================
         objects = self.get_label(index)
-        calib = self.get_calib(index)
 
         # data augmentation for labels
         if random_flip_flag:
@@ -306,7 +339,119 @@ class KITTI_Dataset(data.Dataset):
                 mask_2d[i] = 1
 
             calibs[i] = calib.P2
+        if random_mix_flag == True:
+        # if False:
+            objects = self.get_label(random_index)
+            # data augmentation for labels
+            if random_flip_flag:
+                for object in objects:
+                    [x1, _, x2, _] = object.box2d
+                    object.box2d[0],  object.box2d[2] = img_size[0] - x2, img_size[0] - x1
+                    object.ry = np.pi - object.ry
+                    object.pos[0] *= -1
+                    if object.ry > np.pi:  object.ry -= 2 * np.pi
+                    if object.ry < -np.pi: object.ry += 2 * np.pi
+            object_num_temp = len(objects) if len(objects) < (self.max_objs - object_num) else (self.max_objs - object_num)
+            for i in range(object_num_temp):
+                # filter objects by writelist
+                if objects[i].cls_type not in self.writelist:
+                    continue
 
+                # filter inappropriate samples
+                if objects[i].level_str == 'UnKnown' or objects[i].pos[-1] < 2:
+                    continue
+
+                # ignore the samples beyond the threshold [hard encoding]
+                threshold = 65
+                if objects[i].pos[-1] > threshold:
+                    continue
+
+                # process 2d bbox & get 2d center
+                bbox_2d = objects[i].box2d.copy()
+                
+                # add affine transformation for 2d boxes.
+                bbox_2d[:2] = affine_transform(bbox_2d[:2], trans)
+                bbox_2d[2:] = affine_transform(bbox_2d[2:], trans)
+
+                # process 3d center
+                center_2d = np.array([(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2], dtype=np.float32)  # W * H
+                corner_2d = bbox_2d.copy()
+
+                center_3d = objects[i].pos + [0, -objects[i].h / 2, 0]  # real 3D center in 3D space
+                center_3d = center_3d.reshape(-1, 3)  # shape adjustment (N, 3)
+                center_3d, _ = calib.rect_to_img(center_3d)  # project 3D center to image plane
+                center_3d = center_3d[0]  # shape adjustment
+                if random_flip_flag and not self.aug_calib:  # random flip for center3d
+                    center_3d[0] = img_size[0] - center_3d[0]
+                center_3d = affine_transform(center_3d.reshape(-1), trans)
+
+                # filter 3d center out of img
+                proj_inside_img = True
+
+                if center_3d[0] < 0 or center_3d[0] >= self.resolution[0]: 
+                    proj_inside_img = False
+                if center_3d[1] < 0 or center_3d[1] >= self.resolution[1]: 
+                    proj_inside_img = False
+
+                if proj_inside_img == False:
+                        continue
+
+                # class
+                cls_id = self.cls2id[objects[i].cls_type]
+                labels[i + object_num] = cls_id
+
+                # encoding 2d/3d boxes
+                w, h = bbox_2d[2] - bbox_2d[0], bbox_2d[3] - bbox_2d[1]
+                size_2d[i + object_num] = 1. * w, 1. * h
+
+                center_2d_norm = center_2d / self.resolution
+                size_2d_norm = size_2d[i + object_num] / self.resolution
+
+                corner_2d_norm = corner_2d
+                corner_2d_norm[0: 2] = corner_2d[0: 2] / self.resolution
+                corner_2d_norm[2: 4] = corner_2d[2: 4] / self.resolution
+                center_3d_norm = center_3d / self.resolution
+
+                l, r = center_3d_norm[0] - corner_2d_norm[0], corner_2d_norm[2] - center_3d_norm[0]
+                t, b = center_3d_norm[1] - corner_2d_norm[1], corner_2d_norm[3] - center_3d_norm[1]
+
+                if l < 0 or r < 0 or t < 0 or b < 0:
+                    if self.clip_2d:
+                        l = np.clip(l, 0, 1)
+                        r = np.clip(r, 0, 1)
+                        t = np.clip(t, 0, 1)
+                        b = np.clip(b, 0, 1)
+                    else:
+                        continue		
+
+                boxes[i + object_num] = center_2d_norm[0], center_2d_norm[1], size_2d_norm[0], size_2d_norm[1]
+                boxes_3d[i + object_num] = center_3d_norm[0], center_3d_norm[1], l, r, t, b
+
+                # encoding depth
+                if self.depth_scale == 'normal':
+                    depth[i + object_num] = objects[i].pos[-1] * crop_scale
+                
+                elif self.depth_scale == 'inverse':
+                    depth[i + object_num] = objects[i].pos[-1] / crop_scale
+                
+                elif self.depth_scale == 'none':
+                    depth[i + object_num] = objects[i].pos[-1]
+
+                # encoding heading angle
+                heading_angle = calib.ry2alpha(objects[i].ry, (objects[i].box2d[0] + objects[i].box2d[2]) / 2)
+                if heading_angle > np.pi:  heading_angle -= 2 * np.pi  # check range
+                if heading_angle < -np.pi: heading_angle += 2 * np.pi
+                heading_bin[i + object_num], heading_res[i + object_num] = angle2class(heading_angle)
+
+                # encoding size_3d
+                src_size_3d[i + object_num] = np.array([objects[i].h, objects[i].w, objects[i].l], dtype=np.float32)
+                mean_size = self.cls_mean_size[self.cls2id[objects[i].cls_type]]
+                size_3d[i + object_num] = src_size_3d[i + object_num] - mean_size
+
+                if objects[i].trucation <= 0.5 and objects[i].occlusion <= 2:
+                    mask_2d[i + object_num] = 1
+
+                calibs[i + object_num] = calib.P2
         # collect return data
         inputs = img
         targets = {

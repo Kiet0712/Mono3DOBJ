@@ -77,7 +77,7 @@ class Tester(object):
 
             start_time = time.time()
             ###dn
-            outputs = self.model(inputs, calibs, img_sizes)
+            outputs = self.model(inputs, calibs, None, img_sizes)
             ###
             end_time = time.time()
             model_infer_time += end_time - start_time

@@ -118,7 +118,7 @@ class SetCriterion(nn.Module):
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
+        target_classes[idx] = target_classes_o.long()
         target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
         target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
@@ -130,7 +130,7 @@ class SetCriterion(nn.Module):
         
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        return {'loss_vfl_2d': loss}
+        return {'loss_vfl': loss}
 
     def loss_labels_vfl_3DIoU(self, outputs, targets, indices, num_boxes, calibs, log=True):
         assert 'pred_boxes' in outputs
@@ -146,7 +146,7 @@ class SetCriterion(nn.Module):
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
+        target_classes[idx] = target_classes_o.long()
         target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
         target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
@@ -158,7 +158,7 @@ class SetCriterion(nn.Module):
         
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        return {'loss_vfl_3d': loss}
+        return {'loss_vfl': loss}
     
     def loss_labels(self, outputs, targets, indices, num_boxes, calibs, log=True):
         """Classification loss (Binary focal loss)
@@ -241,7 +241,7 @@ class SetCriterion(nn.Module):
         target_depths = torch.cat([t['depth'][i] for t, (_, i) in zip(targets, indices)], dim=0).squeeze()
 
         depth_input, depth_log_variance = src_depths[:, 0], src_depths[:, 1] 
-        depth_loss = 1.4142 * torch.exp(-depth_log_variance) * torch.abs(depth_input - target_depths) + depth_log_variance  
+        depth_loss = (1.4142 * torch.exp(-depth_log_variance) * torch.abs(depth_input - target_depths) + depth_log_variance)
         losses = {}
         losses['loss_depth'] = depth_loss.sum() / num_boxes 
         return losses  
@@ -339,7 +339,7 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k!='denoising_output'}
         group_num = self.group_num if self.training else 1
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -380,8 +380,67 @@ class SetCriterion(nn.Module):
                     idx = self._get_src_permutation_idx(indices)
                     query_i = aux_outputs['query'][idx_i]
                     query = outputs['query'][idx]
-                    loss_query_self_distillation = iou3d * F.smooth_l1_loss(query_i, query.detach(), beta=2.0, reduction=None)
+                    loss_query_self_distillation = iou3d.unsqueeze(-1) * F.smooth_l1_loss(query_i, query.detach(), beta=2.0, reduction='none')
+                    loss_query_self_distillation = loss_query_self_distillation.sum() / num_boxes
                     l_dict = {'loss_query_self_distillation':loss_query_self_distillation}
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+        if 'denoising_output' in outputs:
+            losses.update(self.calculate_dn_loss(outputs, targets, calibs, num_boxes))
+        return losses
+    def calculate_dn_loss(self, outputs, targets, calibs, num_boxes):
+        losses = {}
+        denoising_output, denoising_groups, single_padding = (
+            outputs["denoising_output"],
+            outputs["denoising_groups"],
+            outputs["max_gt_num_per_image"],
+        )
+        device = denoising_output["pred_logits"].device
+        dn_idx = []
+        for i in range(len(targets)):
+            if len(targets[i]["labels"]) > 0:
+                t = torch.arange(0, len(targets[i]["labels"])).long().to(device)
+                t = t.unsqueeze(0).repeat(denoising_groups, 1)
+                tgt_idx = t.flatten()
+                output_idx = (
+                    torch.tensor(range(denoising_groups)).to(device) * single_padding
+                ).long().unsqueeze(1) + t
+                output_idx = output_idx.flatten()
+            else:
+                output_idx = tgt_idx = torch.tensor([]).long().to(device)
+
+            dn_idx.append((output_idx, tgt_idx))
+        for loss in self.losses:
+            if loss == 'depth_map':
+                # Intermediate masks losses are too costly to compute, we ignore them.
+                continue
+            kwargs = {}
+            if loss == 'labels':
+                # Logging is enabled only for the last layer
+                kwargs = {'log': False}
+            l_dict = self.get_loss(loss, denoising_output, targets, dn_idx, num_boxes* denoising_groups // 11, calibs, **kwargs)
+            l_dict = {k + f'_dn': v for k, v in l_dict.items()}
+            losses.update(l_dict)
+        iou3d_dn = self.IoU3D(denoising_output, targets, dn_idx, calibs)
+        for i, aux_outputs in enumerate(denoising_output['aux_outputs']):
+            for loss in self.losses:
+                if loss == 'depth_map':
+                    # Intermediate masks losses are too costly to compute, we ignore them.
+                    continue
+                kwargs = {}
+                if loss == 'labels':
+                    # Logging is enabled only for the last layer
+                    kwargs = {'log': False}
+                l_dict = self.get_loss(loss, aux_outputs, targets, dn_idx, num_boxes* denoising_groups // 11, calibs, **kwargs)
+                l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+            if self.query_self_distillation:
+                idx = self._get_src_permutation_idx(dn_idx)
+                query_i = aux_outputs['query'][idx]
+                query = denoising_output['query'][idx]
+                loss_query_self_distillation = iou3d_dn.unsqueeze(-1) * F.smooth_l1_loss(query_i, query.detach(), beta=2.0, reduction='none')
+                loss_query_self_distillation = loss_query_self_distillation.sum() / (num_boxes * denoising_groups // 11)
+                l_dict = {'loss_query_self_distillation':loss_query_self_distillation}
+                l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
         return losses

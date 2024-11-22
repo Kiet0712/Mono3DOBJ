@@ -13,13 +13,14 @@ from .backbone import build_backbone
 from .matcher import build_matcher
 from .depthaware_transformer import build_depthaware_transformer
 from .depth_predictor import DepthPredictor
-from .dn_components import prepare_for_dn, dn_post_process, compute_dn_loss
 from .criterion import SetCriterion
+from .denoising import build_generate_DN_queries
+
 
 class MonoDETR(nn.Module):
     """ This is the MonoDETR module that performs monocualr 3D object detection """
     def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, query_self_distillation=False, group_num=11):
+                 aux_loss=True, query_self_distillation=False, generate_DN_queries = None, group_num=11):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -28,8 +29,6 @@ class MonoDETR(nn.Module):
             num_queries: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For KITTI, we recommend 50 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-            with_box_refine: iterative bounding box refinement
-            two_stage: two-stage MonoDETR
         """
         super().__init__()
  
@@ -39,7 +38,6 @@ class MonoDETR(nn.Module):
         hidden_dim = depthaware_transformer.d_model
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
-        self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)  # # for indicator
         # prediction heads
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         prior_prob = 0.01
@@ -50,10 +48,6 @@ class MonoDETR(nn.Module):
         self.dim_embed_3d = MLP(hidden_dim, hidden_dim, 3, 2)
         self.angle_embed = MLP(hidden_dim, hidden_dim, 24, 2)
         self.depth_embed = MLP(hidden_dim, hidden_dim, 2, 2)  # depth and deviation
-
-        if init_box == True:
-            nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
         self.query_embed = nn.Embedding(num_queries * group_num, hidden_dim*2)
 
@@ -82,42 +76,39 @@ class MonoDETR(nn.Module):
         
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.with_box_refine = with_box_refine
         self.num_classes = num_classes
 
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
-        # if two-stage, the last class_embed and bbox_embed is for region proposal generation
-        num_pred = (depthaware_transformer.decoder.num_layers + 1) if two_stage else depthaware_transformer.decoder.num_layers
-        if with_box_refine:
-            self.class_embed = get_clones(self.class_embed, num_pred)
-            self.bbox_embed = get_clones(self.bbox_embed, num_pred)
-            nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
-            # hack implementation for iterative bounding box refinement
-            self.depthaware_transformer.decoder.bbox_embed = self.bbox_embed
-            self.dim_embed_3d = get_clones(self.dim_embed_3d, num_pred)
-            self.depthaware_transformer.decoder.dim_embed = self.dim_embed_3d  
-            self.angle_embed = get_clones(self.angle_embed, num_pred)
-            self.depth_embed = get_clones(self.depth_embed, num_pred)
-            self.depthaware_transformer.decoder.depth_embed = self.depth_embed
-        else:
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
-            self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
-            self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
-            self.dim_embed_3d = nn.ModuleList([self.dim_embed_3d for _ in range(num_pred)])
-            self.angle_embed = nn.ModuleList([self.angle_embed for _ in range(num_pred)])
-            self.depth_embed = nn.ModuleList([self.depth_embed for _ in range(num_pred)])
-            self.depthaware_transformer.decoder.bbox_embed = None
+        num_pred = depthaware_transformer.decoder.num_layers
+        self.class_embed = get_clones(self.class_embed, num_pred)
+        self.bbox_embed = get_clones(self.bbox_embed, num_pred)
+        nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+        # hack implementation for iterative bounding box refinement
+        self.depthaware_transformer.decoder.bbox_embed = self.bbox_embed
+        self.dim_embed_3d = get_clones(self.dim_embed_3d, num_pred)
+        self.depthaware_transformer.decoder.dim_embed = self.dim_embed_3d  
+        self.angle_embed = get_clones(self.angle_embed, num_pred)
+        self.depth_embed = get_clones(self.depth_embed, num_pred)
+        self.depthaware_transformer.decoder.depth_embed = self.depth_embed
         self.query_self_distillation = query_self_distillation
         if query_self_distillation:
             self.proj_self_distillation = nn.Linear(hidden_dim, hidden_dim)
-
-    def forward(self, images, calibs, img_sizes):
+        self.generate_DN_queries = generate_DN_queries
+        self.group_num = group_num
+    def forward(self, images, calibs, target, img_sizes):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
         """
+
+        if self.training and self.generate_DN_queries is not None:
+            gt_labels_list = [t["labels"].long() for t in target]
+            gt_boxes_list = [t["boxes_3d"] for t in target]
+            gt_depth_list = [t["depth"] for t in target]
+            gt_dim_list = [t["size_3d"] for t in target]
+            gt_heading_bin_list = [t["heading_bin"] for t in target]
 
         features, pos = self.backbone(images)
 
@@ -142,17 +133,30 @@ class MonoDETR(nn.Module):
                 srcs.append(src)
                 masks.append(mask)
                 pos.append(pos_l)
-
+        attn_mask = None
+        noised_label_queries = None
+        noised_box_queries = None
+        noised_query_embed = None
         if self.training:
             query_embeds = self.query_embed.weight
+            if self.generate_DN_queries is not None:
+                (
+                    noised_label_queries,
+                    noised_box_queries,
+                    attn_mask,
+                    denoising_groups,
+                    max_gt_num_per_image,
+                ) = self.generate_DN_queries(gt_labels_list, gt_boxes_list, gt_depth_list, gt_dim_list, gt_heading_bin_list)
+                noised_query_embed, noised_label_queries = torch.split(noised_label_queries, self.hidden_dim, dim=-1)
+
         else:
             # only use one group in inference
             query_embeds = self.query_embed.weight[:self.num_queries]
 
-        pred_depth_map_logits, depth_pos_embed, weighted_depth, depth_pos_embed_ip = self.depth_predictor(srcs, masks[1], pos[1])
+        pred_depth_map_logits, depth_pos_embed, weighted_depth = self.depth_predictor(srcs, masks[1], pos[1])
         
         hs, init_reference, inter_references, inter_references_dim, inter_references_depths = self.depthaware_transformer(
-            srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip, weighted_depth)#, attn_mask)
+            srcs, masks, pos, query_embeds, noised_label_queries, noised_box_queries, noised_query_embed, depth_pos_embed, attn_mask)
 
         outputs_coords = []
         outputs_classes = []
@@ -217,8 +221,63 @@ class MonoDETR(nn.Module):
         outputs_3d_dim = torch.stack(outputs_3d_dims)
         outputs_depth = torch.stack(outputs_depths)
         outputs_angle = torch.stack(outputs_angles)
-  
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+
+        if self.generate_DN_queries is not None and self.training:
+            out = {
+                "denoising_groups": torch.tensor(denoising_groups).cuda(),
+                "max_gt_num_per_image": torch.tensor(max_gt_num_per_image).cuda(),
+            }
+
+            padding_size = out["max_gt_num_per_image"] * out["denoising_groups"]
+
+            outputs_known_class = outputs_class[:, :, :padding_size, :]
+            outputs_known_coord = outputs_coord[:, :, :padding_size, :]
+            outputs_known_3d_dim = outputs_3d_dim[:, :, :padding_size, :]
+            outputs_known_depth = outputs_depth[:, :, :padding_size, :]
+            outputs_known_angle = outputs_angle[:, :, :padding_size, :]
+            if self.query_self_distillation:
+                if self.training:
+                    known_hs = hs[:, :, :padding_size, :]
+            output_denoising = {'pred_logits': outputs_known_class[-1], 'pred_boxes': outputs_known_coord[-1]}
+            output_denoising['pred_3d_dim'] = outputs_known_3d_dim[-1]
+            output_denoising['pred_depth'] = outputs_known_depth[-1]
+            output_denoising['pred_angle'] = outputs_known_angle[-1]
+
+            if self.query_self_distillation:
+                if self.training:
+                    output_denoising['query'] = known_hs[-1]
+
+            if self.aux_loss:
+                if not self.query_self_distillation:
+                    output_denoising['aux_outputs'] = self._set_aux_loss(
+                        outputs_known_class, outputs_known_coord, outputs_known_3d_dim, outputs_known_angle, outputs_known_depth)
+                else:
+                    if self.training:
+                        output_denoising['aux_outputs'] = self._set_aux_loss(
+                            outputs_known_class, outputs_known_coord, outputs_known_3d_dim, outputs_known_angle, outputs_known_depth, known_hs)
+                    else:
+                        output_denoising['aux_outputs'] = self._set_aux_loss(
+                            outputs_known_class, outputs_known_coord, outputs_known_3d_dim, outputs_known_angle, outputs_known_depth)
+            
+            outputs_class = outputs_class[:, :, padding_size:, :]
+            outputs_coord = outputs_coord[:, :, padding_size:, :]
+            outputs_3d_dim = outputs_3d_dim[:, :, padding_size:, :]
+            outputs_depth = outputs_depth[:, :, padding_size:, :]
+            outputs_angle = outputs_angle[:, :, padding_size:, :]
+            if self.query_self_distillation:
+                if self.training:
+                    hs = hs[:, :, padding_size:, :]
+
+        if self.generate_DN_queries is None:
+            out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        else:
+            if self.training:
+                out['pred_logits'] = outputs_class[-1]
+                out['pred_boxes'] = outputs_coord[-1]
+            else:
+                out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if self.generate_DN_queries is not None and self.training:
+            out['denoising_output'] = output_denoising
         out['pred_3d_dim'] = outputs_3d_dim[-1]
         out['pred_depth'] = outputs_depth[-1]
         out['pred_angle'] = outputs_angle[-1]
@@ -267,7 +326,9 @@ def build(cfg):
 
     # depth prediction module
     depth_predictor = DepthPredictor(cfg)
-
+    generate_DN_queries = None
+    if cfg['use_dn']:
+        generate_DN_queries = build_generate_DN_queries(cfg)
     model = MonoDETR(
         backbone,
         depthaware_transformer,
@@ -276,9 +337,8 @@ def build(cfg):
         num_queries=cfg['num_queries'],
         aux_loss=cfg['aux_loss'],
         num_feature_levels=cfg['num_feature_levels'],
-        with_box_refine=cfg['with_box_refine'],
-        init_box=cfg['init_box'],
-        query_self_distillation=cfg['query_self_distillation'])
+        query_self_distillation=cfg['query_self_distillation'],
+        generate_DN_queries = generate_DN_queries)
 
     # matcher
     matcher = build_matcher(cfg)
@@ -292,6 +352,16 @@ def build(cfg):
     weight_dict['loss_center'] = cfg['3dcenter_loss_coef']
     weight_dict['loss_depth_map'] = cfg['depth_map_loss_coef']
     weight_dict['loss_query_self_distillation'] = cfg['query_self_distillation_loss_coef']
+    weight_dict['loss_vfl'] = cfg['cls_loss_coef']
+
+    weight_dict['loss_ce_dn']= cfg['cls_loss_coef']
+    weight_dict['loss_bbox_dn'] = cfg['bbox_loss_coef']
+    weight_dict['loss_giou_dn'] = cfg['giou_loss_coef']
+    weight_dict['loss_angle_dn'] = cfg['angle_loss_coef']
+    weight_dict['loss_center_dn'] = cfg['3dcenter_loss_coef']
+    weight_dict['loss_dim_dn'] = cfg['dim_loss_coef']
+    weight_dict['loss_depth_dn'] = cfg['depth_loss_coef']
+    weight_dict['loss_query_self_distillation_dn'] = cfg['query_self_distillation_loss_coef']
     # TODO this is a hack
     if cfg['aux_loss']:
         aux_weight_dict = {}
@@ -306,7 +376,6 @@ def build(cfg):
             losses[0] = 'label_vfl_3d'
         else:
             losses[0] = 'label_vfl_2d'
-
     criterion = SetCriterion(
         cfg['num_classes'],
         matcher=matcher,

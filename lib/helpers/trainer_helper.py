@@ -129,7 +129,7 @@ class Trainer(object):
             ###
             # train one batch
             self.optimizer.zero_grad()
-            outputs = self.model(inputs, calibs, img_sizes)
+            outputs = self.model(inputs, calibs, targets, img_sizes)
             mask_dict=None
             #ipdb.set_trace()
             detr_losses_dict = self.detr_loss(outputs, targets, calibs, mask_dict)
@@ -141,23 +141,36 @@ class Trainer(object):
             detr_losses_dict = misc.reduce_dict(detr_losses_dict)
             detr_losses_dict_log = {}
             detr_losses_log = 0
+            detr_losses_dn_log = 0
             for k in detr_losses_dict.keys():
                 if k in weight_dict:
                     detr_losses_dict_log[k] = (detr_losses_dict[k] * weight_dict[k]).item()
-                    detr_losses_log += detr_losses_dict_log[k]
+                    if 'dn' not in k:
+                        detr_losses_log += detr_losses_dict_log[k]
+                    else:
+                        detr_losses_dn_log += detr_losses_dict_log[k]
             detr_losses_dict_log["loss_detr"] = detr_losses_log
-
-            flags = [True] * 5
+            detr_losses_dict_log["loss_detr_dn"] = detr_losses_dn_log
+            flags = [True] * 13
             if batch_idx % 30 == 0:
                 print("----", batch_idx, "----")
                 print("%s: %.2f, " %("loss_detr", detr_losses_dict_log["loss_detr"]))
+                print("%s: %.2f, " %("loss_detr_dn", detr_losses_dict_log["loss_detr_dn"]))
                 for key, val in detr_losses_dict_log.items():
-                    if key == "loss_detr":
+                    if key == "loss_detr" or key=="loss_detr_dn":
                         continue
                     if "0" in key or "1" in key or "2" in key or "3" in key or "4" in key or "5" in key:
                         if flags[int(key[-1])]:
                             print("")
                             flags[int(key[-1])] = False
+                    if "dn" in key:
+                        if flags[-1]:
+                            print("")
+                            flags[-1] = False
+                        if "0" in key or "1" in key or "2" in key or "3" in key or "4" in key or "5" in key:
+                            if flags[int(key[-1])+6]:
+                                print("")
+                                flags[int(key[-1])+6] = False
                     print("%s: %.2f, " %(key, val), end="")
                 print("")
                 print("")

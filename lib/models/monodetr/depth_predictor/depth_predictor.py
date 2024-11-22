@@ -88,7 +88,7 @@ class DepthPredictor(nn.Module):
         depth_pos_embed_ip = self.interpolate_depth_embed(weighted_depth)
         depth_embed = depth_embed + depth_pos_embed_ip
 
-        return depth_logits, depth_embed, weighted_depth, depth_pos_embed_ip
+        return depth_logits, depth_embed, weighted_depth
 
     def interpolate_depth_embed(self, depth):
         depth = depth.clamp(min=0, max=self.depth_max)

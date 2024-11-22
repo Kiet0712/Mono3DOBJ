@@ -21,11 +21,10 @@ class DepthAwareTransformer(nn.Module):
             dim_feedforward=1024,
             dropout=0.1,
             activation="relu",
-            return_intermediate_dec=False,
             num_feature_levels=4,
             dec_n_points=4,
             enc_n_points=4,
-            relation_depth_cross_attention=False,
+            use_dn = False,
             group_num=11):
 
         super().__init__()
@@ -40,12 +39,15 @@ class DepthAwareTransformer(nn.Module):
 
         decoder_layer = DepthAwareDecoderLayer(
             d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points, group_num=group_num)
-        self.decoder = DepthAwareDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec, d_model, relation_depth_cross_attention)
+        self.decoder = DepthAwareDecoder(decoder_layer, num_decoder_layers, d_model)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
-        self.reference_points = nn.Linear(d_model, 2)
-
+        self.use_dn = use_dn
+        if self.use_dn:
+            self.reference_points = nn.Linear(d_model, 6)
+        else:
+            self.reference_points = nn.Linear(d_model, 2)
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -68,7 +70,7 @@ class DepthAwareTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, depth_pos_embed=None, depth_pos_embed_ip=None, weighted_depth = None, attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, dn_query_embed = None, dn_boxes_queries = None, noised_query_embed = None, depth_pos_embed=None, attn_mask=None):
 
         # prepare input for encoder
         src_flatten = []
@@ -103,10 +105,13 @@ class DepthAwareTransformer(nn.Module):
         query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
         tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
         reference_points = self.reference_points(query_embed).sigmoid()
+        if self.use_dn and self.training:
+            tgt = torch.cat((dn_query_embed, tgt), dim=1)
+            reference_points = torch.cat((dn_boxes_queries, reference_points), dim=1)
+            query_embed = torch.cat((noised_query_embed, query_embed), dim=1)
         init_reference_out = reference_points
 
         depth_pos_embed = depth_pos_embed.flatten(2).permute(2, 0, 1)
-        depth_pos_embed_ip = depth_pos_embed_ip.flatten(2).permute(2, 0, 1)
         mask_depth = masks[1].flatten(1)
 
         # decoder
@@ -121,7 +126,7 @@ class DepthAwareTransformer(nn.Module):
             query_embed, #,INFo
             mask_flatten,
             depth_pos_embed,
-            mask_depth, bs=bs, depth_pos_embed_ip=depth_pos_embed_ip, weighted_depth = weighted_depth, pos_embeds=pos_embeds,attn_mask=attn_mask)
+            mask_depth, bs=bs, pos_embeds=pos_embeds,attn_mask=attn_mask)
 
         inter_references_out = inter_references
         inter_references_out_dim = inter_references_dim
@@ -138,8 +143,7 @@ def build_depthaware_transformer(cfg):
         dim_feedforward=cfg['dim_feedforward'],
         num_encoder_layers=cfg['enc_layers'],
         num_decoder_layers=cfg['dec_layers'],
-        return_intermediate_dec=cfg['return_intermediate_dec'],
         num_feature_levels=cfg['num_feature_levels'],
         dec_n_points=cfg['dec_n_points'],
         enc_n_points=cfg['enc_n_points'],
-        relation_depth_cross_attention=cfg['relation_depth_cross_attention'])
+        use_dn=cfg['use_dn'])

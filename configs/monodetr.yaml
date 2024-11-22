@@ -3,10 +3,10 @@ random_seed: 444
 
 dataset:
   type: &dataset_type 'KITTI'
-  root_dir: 'data/KITTIDataset'
+  root_dir: '/workspace/datasets/Kitti3D'
   train_split: 'train'
   test_split: 'val'
-  batch_size: 16
+  batch_size: 8
   use_3d_center: True
   class_merging: False
   use_dontcare: False
@@ -30,16 +30,11 @@ model_name: 'monodetr'
 model:
 
   #contribution
-  depth_aware_matching_3d: False
-  stable_epoch_start_matching_3d: 125
   use_vfl: False
   use_vfl_with_3dIoU: False
-  query_self_distillation: False
-  relation_self_attention: False
-  relation_depth_cross_attention: False
+  query_self_distillation: True
 
   num_classes: 3
-  return_intermediate_dec: True
   device: 'cuda'
 
   # Backbone
@@ -58,7 +53,6 @@ model:
 
   # Transformer
   with_box_refine: True
-  init_box: False
   enc_layers: 3
   dec_layers: 3
   hidden_dim: 256
@@ -89,9 +83,17 @@ model:
   set_cost_bbox: 5
   set_cost_giou: 2
   set_cost_3dcenter: 10
-  set_cost_depth: 0
-  set_cost_dim: 0
-  set_cost_angle: 0
+  set_cost_depth: 1
+  set_cost_dim: 1
+  set_cost_angle: 1
+
+  #dn
+  use_dn: True
+  label_noise_prob: 0.2
+  box_noise_scale: 0.4
+  angle_noise_prob: 0.2
+  boxes3d_noise_scale: 0.4
+  with_indicators: True
 
 optimizer:
   type: 'adamw'
@@ -102,16 +104,16 @@ optimizer:
 lr_scheduler:
   type: 'step'  # 'step' or 'cos'
   warmup: False  # 5 epoches, cosine warmup, init_lir=0.00001 in default
-  decay_rate: 0.1
-  decay_list: [125, 165]
+  decay_rate: 0.5
+  decay_list: [85, 125, 165, 225]
 
 
 trainer:
-  max_epoch: 195
+  max_epoch: 250
   gpu_ids: '1'
   save_frequency: 1  # checkpoint save interval (in epoch)
   # resume_model: True
-  # pretrain_model: path/to/ckpt
+  # pretrain_model: /workspace/source/Mono3DOBJ/outputs/monodetr/checkpoint.pth
   save_path: 'outputs/'
   save_all: False  # False for only savng the best and latest ckpts
   num_patterns: 0
@@ -119,6 +121,6 @@ trainer:
 tester:
   type: *dataset_type
   mode: single  # 'single' or 'all'; 'all' to evaluate all ckpts in the folder
-  checkpoint: 195  # the start ckpt epoch for 'all'
+  checkpoint: 250  # the start ckpt epoch for 'all'
   threshold: 0.2  # confidence filter
   topk: 50
